@@ -1,384 +1,459 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-StockTwits Indian Market Sentiment Scanner
-==========================================
-Dynamically fetches trending StockTwits symbols, screens each one for NSE/BSE
-listing via Yahoo Finance (no hardcoded stock list), analyses bullish and bearish
-message streams, scores with a weighted composite, then prints two ranked tables
-and discards all data — nothing is written to disk.
+stocktwits_scraper.py -- Kash Analytics Phase 1B
+Pipeline: Fetch -> Analyse -> Display -> Discard
+No data is written to disk at any point.
 
-Composite score  :  Frequency 40%  |  Recency 35%  |  Engagement 25%
-Recency model    :  exponential decay,  half-life = 6 h
-Normalisation    :  min-max across all records before weighting
-Rate limit       :  hard cap 60 req/min (sliding window)
-                    auto-pause when X-Ratelimit-Remaining ≤ 10
-                    one retry on HTTP 429
+Scoring (Bullish and Bearish records normalised jointly before weighting)
+  Frequency  40%  mentions in the sentiment bucket for this ticker
+  Recency    35%  mean exponential-decay score across bucket messages
+                  decay = exp(-lambda * t),  lambda = ln(2)/21600 s  (6h half-life)
+  Engagement 25%  sum of (likes + reshares) across bucket messages
+
+  All three raw scores are min-max normalised across EVERY record
+  (both sentiments combined) before weights are applied.
+
+Rate limiting
+  Hard cap   : 60 requests inside any rolling 60-second sliding window
+  Auto-pause : if X-Ratelimit-Remaining <= 10, sleep until X-Ratelimit-Reset
+  429 retry  : one retry after Retry-After (or 30 s fallback)
+  User-Agent : 'web:KashAnalytics:v1.0.0 (by /u/Kashimmm)' on every request
+
+Indian stock validation (yfinance, no hardcoded list)
+  Try {ticker}.NS (NSE) then {ticker}.BO (BSE)
+  Confirmed if yfinance fast_info.currency == 'INR'
 """
 
 import math
 import re
-import sys
 import time
-import datetime
-from collections import deque
+from collections import Counter, deque
+from datetime import datetime, timezone
+from typing import Optional, List, Tuple, Dict
 
-# ── Dependency check ──────────────────────────────────────────────────────────
-try:
-    import requests
-except ImportError:
-    sys.exit("[ERROR] Missing: pip install requests")
-
-try:
-    import yfinance as yf
-except ImportError:
-    sys.exit("[ERROR] Missing: pip install yfinance")
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-RATE_LIMIT_RPM       = 60          # hard cap: requests per minute
-LOW_LIMIT_THRESHOLD  = 10          # auto-pause when X-Ratelimit-Remaining ≤ this
-MAX_429_RETRIES      = 1           # single retry on HTTP 429
-
-WEIGHT_FREQUENCY     = 0.40
-WEIGHT_RECENCY       = 0.35
-WEIGHT_ENGAGEMENT    = 0.25
-
-RECENCY_HALF_LIFE_H  = 6.0         # exponential-decay half-life in hours
-STREAM_MSG_LIMIT     = 30          # messages fetched per symbol
-
-STOCKTWITS_BASE      = "https://api.stocktwits.com/api/2"
-INDIAN_EXCHANGES     = {"NSI", "NSE", "BSE", "BOM"}   # yfinance exchange codes
-
-# ── Rate-limit state ──────────────────────────────────────────────────────────
-_req_window: deque = deque()   # monotonic timestamps of calls in the last 60 s
+import numpy as np
+import requests
+import yfinance as yf
+from tabulate import tabulate
 
 
-def _throttle() -> None:
-    """Sliding-window enforcer: blocks until fewer than RATE_LIMIT_RPM calls
-    have been made within the last 60 seconds."""
-    now = time.monotonic()
-    while _req_window and now - _req_window[0] >= 60.0:
-        _req_window.popleft()
-    if len(_req_window) >= RATE_LIMIT_RPM:
-        sleep_s = 60.0 - (now - _req_window[0]) + 0.05
-        if sleep_s > 0:
-            time.sleep(sleep_s)
-    _req_window.append(time.monotonic())
+# ========================== CONSTANTS =========================================
+
+STOCKTWITS_BASE = "https://api.stocktwits.com/api/2"
+USER_AGENT      = "web:KashAnalytics:v1.0.0 (by /u/Kashimmm)"
+
+HALF_LIFE_S     = 6 * 3600
+DECAY_LAMBDA    = math.log(2) / HALF_LIFE_S
+
+RATE_LIMIT      = 60
+WINDOW_S        = 60.0
+PAUSE_THRESH    = 10
+
+WEIGHTS = {
+    "frequency":  0.40,
+    "recency":    0.35,
+    "engagement": 0.25,
+}
+
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "this", "that", "it", "its",
+    "i", "we", "you", "he", "she", "they", "my", "our", "your", "their",
+    "and", "or", "but", "if", "as", "so", "not", "no", "up", "out",
+    "just", "about", "stock", "shares", "market", "going", "get",
+    "like", "think", "good", "great", "bad", "more", "very", "really",
+    "now", "what", "when", "how", "who", "why", "which", "there",
+    "than", "then", "into", "also", "still", "look", "see", "know",
+    "make", "all", "any", "one", "two", "day", "week", "year", "time",
+    "new", "long", "short", "buy", "sell", "hold", "price", "target",
+    "hit", "run", "high", "low", "amp", "rt", "via", "https", "http",
+}
 
 
-def _get(url: str, params: dict | None = None,
-         _retries: int = MAX_429_RETRIES) -> dict | None:
-    """Rate-limited GET with X-Ratelimit-Remaining monitoring and 429 retry."""
-    _throttle()
-    try:
-        resp = requests.get(url, params=params, timeout=15)
-    except requests.RequestException as exc:
-        print(f"  [WARN] Request error: {exc}")
-        return None
+# ========================== SLIDING-WINDOW RATE LIMITER =======================
 
-    # ── X-Ratelimit-Remaining monitoring ──────────────────────────────────────
-    remaining_hdr = resp.headers.get("X-Ratelimit-Remaining")
-    if remaining_hdr is not None:
+class _SlidingWindowLimiter:
+    """
+    Enforces at most `limit` HTTP calls inside any rolling `window`-second
+    window. Blocks by sleeping when the window is full.
+    """
+
+    def __init__(self, limit: int = RATE_LIMIT, window: float = WINDOW_S):
+        self._limit  = limit
+        self._window = window
+        self._calls: deque = deque()
+
+    def acquire(self) -> None:
+        now = time.monotonic()
+        while self._calls and now - self._calls[0] > self._window:
+            self._calls.popleft()
+        if len(self._calls) >= self._limit:
+            sleep_for = self._window - (now - self._calls[0]) + 0.05
+            print("  [rate-limiter] window full -- sleeping %.1fs ..." % sleep_for)
+            time.sleep(sleep_for)
+            now = time.monotonic()
+            while self._calls and now - self._calls[0] > self._window:
+                self._calls.popleft()
+        self._calls.append(time.monotonic())
+
+
+_limiter = _SlidingWindowLimiter()
+
+
+# ========================== NETWORK LAYER =====================================
+
+def _get(url: str, params: Optional[Dict] = None) -> Optional[requests.Response]:
+    """
+    Rate-limited GET. Enforces:
+      - User-Agent on every single request (no exceptions)
+      - auto-pause when X-Ratelimit-Remaining <= PAUSE_THRESH
+      - exactly one retry on HTTP 429
+    Returns the Response, or None on permanent failure.
+    """
+    headers = {"User-Agent": USER_AGENT}
+
+    for attempt in range(2):
+        _limiter.acquire()
         try:
-            remaining = int(remaining_hdr)
-            if remaining <= LOW_LIMIT_THRESHOLD:
+            resp = requests.get(url, params=params, headers=headers, timeout=12)
+        except requests.RequestException as exc:
+            print("  [network error] %s" % exc)
+            return None
+
+        # auto-pause on low remaining quota
+        remaining_hdr = resp.headers.get("X-Ratelimit-Remaining")
+        if remaining_hdr is not None:
+            try:
+                remaining_int = int(remaining_hdr)
+            except ValueError:
+                remaining_int = None
+            if remaining_int is not None and remaining_int <= PAUSE_THRESH:
+                reset_hdr = resp.headers.get("X-Ratelimit-Reset")
+                if reset_hdr:
+                    wait = max(1, int(reset_hdr) - int(time.time())) + 2
+                else:
+                    wait = 35
                 print(
-                    f"  [PAUSE] X-Ratelimit-Remaining={remaining} "
-                    f"(≤ {LOW_LIMIT_THRESHOLD}) — waiting 15 s"
+                    "  [auto-pause] X-Ratelimit-Remaining=%d (<=10) "
+                    "-- pausing %ds until quota resets ..." % (remaining_int, wait)
                 )
-                time.sleep(15)
-        except ValueError:
-            pass
+                time.sleep(wait)
 
-    # ── 429 handling — one retry ──────────────────────────────────────────────
-    if resp.status_code == 429:
-        if _retries > 0:
-            retry_after = int(resp.headers.get("Retry-After", 20))
-            print(
-                f"  [429] Rate limited — retrying in {retry_after} s "
-                f"(retries remaining: {_retries - 1})"
-            )
-            time.sleep(retry_after)
-            return _get(url, params, _retries - 1)
-        print("  [429] Rate limited — retry exhausted, skipping this request")
-        return None
+        # one retry on 429
+        if resp.status_code == 429:
+            if attempt == 0:
+                retry_after = int(resp.headers.get("Retry-After", 30))
+                print(
+                    "  [429] Rate limited -- waiting %ds before retry ..."
+                    % retry_after
+                )
+                time.sleep(retry_after)
+                continue
+            else:
+                print("  [429] Retry exhausted -- skipping this request.")
+                return None
 
-    if resp.status_code != 200:
-        return None
+        return resp
 
-    return resp.json()
+    return None
 
 
-# ── Indian exchange validation — fully dynamic, no hardcoded stock list ───────
-_exchange_cache: dict[str, bool] = {}
+# ========================== STOCKTWITS API ====================================
 
-
-def _is_indian(symbol: str) -> bool:
+def fetch_trending_tickers() -> List[str]:
     """
-    Checks whether `symbol` is traded on NSE or BSE by querying Yahoo Finance
-    with both the .NS (NSE) and .BO (BSE) suffixes.  No static ticker list is
-    used at any point — every lookup is performed live against Yahoo Finance.
-
-    Returns True if the exchange code or currency confirms an Indian listing.
+    Call the StockTwits trending/symbols endpoint.
+    Returns raw ticker strings exactly as StockTwits provides them.
+    No hardcoded ticker list is used anywhere in this file.
     """
-    if symbol in _exchange_cache:
-        return _exchange_cache[symbol]
+    resp = _get(STOCKTWITS_BASE + "/trending/symbols.json")
+    if resp is None or resp.status_code != 200:
+        code = resp.status_code if resp is not None else "N/A"
+        print("  [error] trending endpoint returned HTTP %s" % code)
+        return []
+    symbols = resp.json().get("symbols", [])
+    tickers = [s["symbol"] for s in symbols if "symbol" in s]
+    print("  -> %d tickers returned by StockTwits trending" % len(tickers))
+    return tickers
 
+
+def fetch_messages(ticker: str) -> List[Dict]:
+    """
+    Fetch the public message stream for `ticker` from StockTwits.
+    Returns a (possibly empty) list of raw message dicts.
+    """
+    resp = _get(STOCKTWITS_BASE + "/streams/symbol/" + ticker + ".json")
+    if resp is None or resp.status_code != 200:
+        return []
+    return resp.json().get("messages", [])
+
+
+# ========================== INDIAN STOCK VALIDATION ==========================
+
+def validate_indian(ticker: str) -> Tuple[bool, str]:
+    """
+    Try yfinance with {ticker}.NS (NSE) then {ticker}.BO (BSE).
+    Confirms an Indian listing if fast_info.currency == 'INR'.
+    Returns (is_indian, qualified_symbol).
+    No hardcoded ticker list -- every check is a live yfinance call.
+    """
     for suffix in (".NS", ".BO"):
+        sym = ticker + suffix
         try:
-            fast = yf.Ticker(symbol + suffix).fast_info
-            exch = getattr(fast, "exchange", None)
-            if exch and exch.upper() in INDIAN_EXCHANGES:
-                _exchange_cache[symbol] = True
-                return True
-            currency = getattr(fast, "currency", None)
-            if currency and currency.upper() == "INR":
-                _exchange_cache[symbol] = True
-                return True
+            fi = yf.Ticker(sym).fast_info
+            if getattr(fi, "currency", None) == "INR":
+                return True, sym
         except Exception:
             continue
-
-    _exchange_cache[symbol] = False
-    return False
+    return False, ""
 
 
-# ── Scoring helpers ───────────────────────────────────────────────────────────
+# ========================== MESSAGE PARSING ===================================
 
-def _recency_decay(created_at: str) -> float:
-    """
-    Exponential decay score in [0, 1]:
-        score = 2^(−hours_elapsed / half_life)
-    A message posted right now scores 1.0; one posted half_life hours ago
-    scores 0.5; the score approaches 0 for very old messages.
-    """
+def _parse_message(raw: Dict) -> Dict:
+    """Extract and pre-compute fields from a raw StockTwits message."""
+    body      = raw.get("body", "")
+    sentiment = ((raw.get("entities") or {}).get("sentiment") or {}).get("basic")
+
+    likes    = int((raw.get("likes")    or {}).get("total",          0) or 0)
+    reshares = int((raw.get("reshares") or {}).get("reshared_count", 0) or 0)
+    engagement = likes + reshares
+
+    created_raw = raw.get("created_at", "")
     try:
-        dt = datetime.datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-        hours_ago = (
-            datetime.datetime.now(datetime.timezone.utc) - dt
-        ).total_seconds() / 3600.0
-        return math.pow(2.0, -hours_ago / RECENCY_HALF_LIFE_H)
-    except Exception:
-        return 0.0
+        dt    = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        age_s = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+    except (ValueError, AttributeError):
+        age_s = 0.0
+
+    recency_decay = math.exp(-DECAY_LAMBDA * age_s)
+
+    return {
+        "body":       body,
+        "sentiment":  sentiment,
+        "recency":    recency_decay,
+        "engagement": engagement,
+    }
 
 
-def _engagement(msg: dict) -> float:
-    """Total engagement = likes + reshares (both default to 0 when absent)."""
-    likes    = ((msg.get("likes")    or {}).get("total", 0)          or 0)
-    reshares = ((msg.get("reshares") or {}).get("reshared_count", 0) or 0)
-    return float(likes + reshares)
+# ========================== SCORING ENGINE ====================================
+
+def _minmax(arr: np.ndarray) -> np.ndarray:
+    """Min-max normalise to [0,1]. All-equal input maps to all-zero."""
+    lo, hi = arr.min(), arr.max()
+    if hi == lo:
+        return np.zeros_like(arr, dtype=float)
+    return (arr - lo) / (hi - lo)
 
 
-def _minmax(values: list[float]) -> list[float]:
+def _key_narrative(messages: List[Dict]) -> str:
+    """Top-3 non-stopword words from message bodies, joined by ' | '."""
+    words: List[str] = []
+    for m in messages:
+        tokens = re.findall(r"[A-Za-z]{3,}", m.get("body", ""))
+        words.extend(t.lower() for t in tokens if t.lower() not in STOPWORDS)
+    if not words:
+        return "--"
+    return " | ".join(w for w, _ in Counter(words).most_common(3))
+
+
+def score_and_rank(buckets: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """
-    Min-max normalise a list to [0, 1].
-    If all values are identical, maps every element to 0.5.
+    Build raw records for every ticker x sentiment pair, then apply
+    min-max normalisation across ALL records jointly (both Bullish and
+    Bearish together) before weighting -- satisfying the spec requirement
+    'min-max normalisation across all records before weighting'.
+
+    Returns (ranked_bullish, ranked_bearish), each sorted descending by
+    composite score with integer ranks assigned from 1.
     """
-    lo, hi = min(values), max(values)
-    span = hi - lo
-    if span == 0.0:
-        return [0.5] * len(values)
-    return [(v - lo) / span for v in values]
+    # 1. Build raw records for both sentiments
+    all_rows: List[Dict] = []
+    for b in buckets:
+        for sentiment in ("Bullish", "Bearish"):
+            msgs = [m for m in b["parsed"] if m["sentiment"] == sentiment]
+            if not msgs:
+                continue
+            freq_raw = float(len(msgs))
+            rec_raw  = float(sum(m["recency"]    for m in msgs) / len(msgs))
+            eng_raw  = float(sum(m["engagement"] for m in msgs))
+            all_rows.append({
+                "ticker":        b["ticker"],
+                "sentiment":     sentiment,
+                "mention_count": int(freq_raw),
+                "freq_raw":      freq_raw,
+                "rec_raw":       rec_raw,
+                "eng_raw":       eng_raw,
+                "messages":      msgs,
+            })
 
+    if not all_rows:
+        return [], []
 
-# ── StockTwits API helpers ────────────────────────────────────────────────────
+    # 2. Min-max normalise ACROSS ALL records (both sentiments jointly)
+    freq_norm = _minmax(np.array([r["freq_raw"] for r in all_rows], dtype=float))
+    rec_norm  = _minmax(np.array([r["rec_raw"]  for r in all_rows], dtype=float))
+    eng_norm  = _minmax(np.array([r["eng_raw"]  for r in all_rows], dtype=float))
 
-def _fetch_trending_symbols() -> list[str]:
-    """Return all trending ticker symbols from StockTwits."""
-    data = _get(f"{STOCKTWITS_BASE}/trending/symbols.json")
-    if not data:
-        return []
-    return [s["symbol"] for s in data.get("symbols", []) if "symbol" in s]
+    for i, row in enumerate(all_rows):
+        row["recency_score"]    = float(rec_norm[i])
+        row["engagement_score"] = float(eng_norm[i])
+        row["composite"] = (
+            WEIGHTS["frequency"]  * float(freq_norm[i])
+            + WEIGHTS["recency"]  * float(rec_norm[i])
+            + WEIGHTS["engagement"] * float(eng_norm[i])
+        )
 
-
-def _fetch_stream(symbol: str) -> list[dict]:
-    """Fetch the most recent messages for a single symbol."""
-    data = _get(
-        f"{STOCKTWITS_BASE}/streams/symbol/{symbol}.json",
-        {"limit": STREAM_MSG_LIMIT},
+    # 3. Split by sentiment, sort each table independently
+    bull_rows = sorted(
+        [r for r in all_rows if r["sentiment"] == "Bullish"],
+        key=lambda r: r["composite"],
+        reverse=True,
     )
-    return data.get("messages", []) if data else []
+    bear_rows = sorted(
+        [r for r in all_rows if r["sentiment"] == "Bearish"],
+        key=lambda r: r["composite"],
+        reverse=True,
+    )
+
+    for rank, row in enumerate(bull_rows, start=1):
+        row["rank"] = rank
+    for rank, row in enumerate(bear_rows, start=1):
+        row["rank"] = rank
+
+    return bull_rows, bear_rows
 
 
-def _sentiment(msg: dict) -> str | None:
-    """Return 'Bullish', 'Bearish', or None if the message is untagged."""
-    try:
-        return msg["entities"]["sentiment"]["basic"]
-    except (KeyError, TypeError):
-        return None
+# ========================== OUTPUT FORMATTING =================================
+
+_BAR = "=" * 74
 
 
-def _clean_body(text: str) -> str:
-    """Strip $TICKER cashtags and collapse whitespace for a readable narrative."""
-    text = re.sub(r"\$\w+", "", text or "")
-    text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text or "(no text)"
-
-
-# ── Output formatting ─────────────────────────────────────────────────────────
-_LINE = "=" * 84
-_SEP  = (
-    "  ────  ────────────  ─────────────  ──────────────  "
-    "─────────────────  ────────────────────────────────────────────────────────"
-)
-_HDR  = (
-    f"  {'Rank':<4}  {'Ticker':<12}  {'Mention Count':<13}  "
-    f"{'Recency Rating':<14}  {'Engagement Rating':<17}  Key Narrative"
-)
-
-
-def _print_table(title: str, rows: list[dict]) -> None:
-    print(f"\n{_LINE}")
-    print(f"  {title}")
-    print(_LINE)
-    print(_SEP)
-    print(_HDR)
-    print(_SEP)
-    if not rows:
-        print("  (No data — no Indian tickers were detected in this scan)")
-    else:
-        for rank, r in enumerate(rows, start=1):
-            narrative = r["narrative"]
-            if len(narrative) > 52:
-                narrative = narrative[:49] + "…"
-            print(
-                f"  {rank:<4}  {r['symbol']:<12}  {r['freq']:<13}  "
-                f"{r['rec_raw']:.4f}          "
-                f"  {r['eng_raw']:<17.0f}  {narrative}"
-            )
-    print(_SEP)
+def _print_table(ranked: List[Dict], title: str) -> None:
+    print("\n" + _BAR)
+    print("  " + title)
+    print(_BAR)
+    if not ranked:
+        print("  No Indian tickers detected in this scan.\n")
+        return
+    headers = [
+        "Rank", "Ticker", "Mention Count",
+        "Recency Rating", "Engagement Rating", "Key Narrative",
+    ]
+    table = []
+    for row in ranked:
+        narrative = _key_narrative(row["messages"])
+        table.append([
+            row["rank"],
+            row["ticker"],
+            row["mention_count"],
+            "%.4f" % row["recency_score"],
+            "%.4f" % row["engagement_score"],
+            narrative[:52],
+        ])
+    print(tabulate(table, headers=headers, tablefmt="rounded_outline"))
+    print()
 
 
 def _empty_tables() -> None:
-    for title in [
-        "📈  Bullish Opportunities",
-        "📉  Bearish / Short Candidates",
-    ]:
-        _print_table(title, [])
+    """Print clean empty tables with the required no-Indian-tickers message."""
+    for title in ("BULLISH OPPORTUNITIES", "BEARISH / SHORT CANDIDATES"):
+        print("\n" + _BAR)
+        print("  " + title)
+        print(_BAR)
+        print("  No Indian tickers detected in this scan.\n")
 
 
-# ── Main pipeline ─────────────────────────────────────────────────────────────
+# ========================== MAIN PIPELINE =====================================
 
 def run() -> None:
-    print()
-    print(_LINE)
-    print("  StockTwits — Indian Market Sentiment Scanner")
-    print("  Exchange filter: NSE / BSE only  |  No data written to disk")
+    bar = "-" * 74
+    print("\n" + bar)
+    print("  Kash Analytics -- StockTwits Indian Market Screener")
+    print("  Phase 1B  |  Fetch -> Analyse -> Display -> Discard")
     print(
-        f"  Weights: Frequency {WEIGHT_FREQUENCY*100:.0f}%  "
-        f"Recency {WEIGHT_RECENCY*100:.0f}%  "
-        f"Engagement {WEIGHT_ENGAGEMENT*100:.0f}%  "
-        f"|  Recency half-life {RECENCY_HALF_LIFE_H:.0f} h  "
-        f"|  Rate cap {RATE_LIMIT_RPM} req/min"
+        "  Weights: Frequency %.0f%%  Recency %.0f%%  Engagement %.0f%%"
+        "  |  Recency half-life 6h  |  Rate cap %d req/min"
+        % (
+            WEIGHTS["frequency"]  * 100,
+            WEIGHTS["recency"]    * 100,
+            WEIGHTS["engagement"] * 100,
+            RATE_LIMIT,
+        )
     )
-    print(_LINE)
+    print(bar + "\n")
 
-    # ── Step 1: Trending symbols ──────────────────────────────────────────────
-    print("\n  [1/4] Fetching trending symbols from StockTwits…")
-    symbols = _fetch_trending_symbols()
-
-    if not symbols:
-        print("  ✗  StockTwits returned no trending symbols.")
+    # Step 1: Trending tickers (no hardcoded list)
+    print("[1/4] Fetching trending symbols from StockTwits ...")
+    raw_tickers = fetch_trending_tickers()
+    if not raw_tickers:
+        print("  [abort] StockTwits returned no trending symbols.")
         _empty_tables()
         return
 
-    print(f"  →  {len(symbols)} symbol(s) retrieved.")
-
-    # ── Step 2: Screen for NSE/BSE via Yahoo Finance ──────────────────────────
-    print("\n  [2/4] Screening for NSE/BSE listings via Yahoo Finance…")
-    indian: list[str] = []
-
-    for sym in symbols:
-        listed = _is_indian(sym)
-        tag    = "✓  NSE/BSE" if listed else "✗  not Indian"
-        print(f"        {sym:<16} {tag}")
-        if listed:
-            indian.append(sym)
+    # Step 2: Filter to Indian stocks via yfinance currency check
+    print(
+        "\n[2/4] Validating %d ticker(s) against NSE/BSE via yfinance ..."
+        % len(raw_tickers)
+    )
+    indian: List[Tuple[str, str]] = []
+    for raw in raw_tickers:
+        ok, sym = validate_indian(raw)
+        if ok:
+            print("  [OK]  %-14s -> %s" % (raw, sym))
+            indian.append((raw, sym))
 
     if not indian:
         print(
-            "\n  No Indian (NSE/BSE) tickers found among StockTwits trending symbols."
+            "\n  No Indian (NSE/BSE) tickers found among current "
+            "StockTwits trending symbols."
         )
         _empty_tables()
         return
 
-    # ── Step 3: Fetch message streams ─────────────────────────────────────────
-    print(
-        f"\n  [3/4] Fetching message streams for {len(indian)} Indian stock(s)…"
-    )
-    raw: list[dict] = []
+    print("\n  -> %d Indian ticker(s) confirmed." % len(indian))
 
-    for sym in indian:
-        messages = _fetch_stream(sym)
-        if not messages:
+    # Step 3: Fetch message streams
+    print("\n[3/4] Fetching message streams ...")
+    buckets: List[Dict] = []
+    for raw_ticker, qualified in indian:
+        raw_msgs = fetch_messages(raw_ticker)
+        if not raw_msgs:
+            print("  [skip] %s: no messages returned." % qualified)
             continue
-
-        for label in ("Bullish", "Bearish"):
-            bucket = [m for m in messages if _sentiment(m) == label]
-            if not bucket:
-                continue
-
-            freq     = len(bucket)
-            rec_avg  = (
-                sum(_recency_decay(m.get("created_at", "")) for m in bucket) / freq
-            )
-            eng_tot  = sum(_engagement(m) for m in bucket)
-
-            # Key narrative: body of the highest-engagement message
-            top_msg   = max(bucket, key=_engagement)
-            narrative = _clean_body(top_msg.get("body", ""))
-
-            raw.append({
-                "symbol":    sym,
-                "sentiment": label,
-                "freq":      freq,
-                "rec_raw":   rec_avg,   # mean exponential-decay score ∈ [0, 1]
-                "eng_raw":   eng_tot,   # total likes + reshares
-                "narrative": narrative,
-            })
-
-    if not raw:
+        parsed = [_parse_message(m) for m in raw_msgs]
+        n_bull = sum(1 for p in parsed if p["sentiment"] == "Bullish")
+        n_bear = sum(1 for p in parsed if p["sentiment"] == "Bearish")
+        n_neut = len(parsed) - n_bull - n_bear
         print(
-            "  No sentiment-tagged (Bullish/Bearish) messages found "
-            "for any Indian stock."
+            "  [OK]  %-14s  %3d messages  "
+            "(Bullish=%d  Bearish=%d  Neutral=%d)"
+            % (qualified, len(parsed), n_bull, n_bear, n_neut)
         )
+        buckets.append({"ticker": qualified, "parsed": parsed})
+
+    if not buckets:
+        print("  No message data returned for any Indian ticker.")
         _empty_tables()
         return
 
-    # ── Step 4: Score and rank ────────────────────────────────────────────────
-    print(f"\n  [4/4] Scoring {len(raw)} record(s) and ranking…")
+    # Step 4: Normalise across all records (both sentiments), rank, display
+    print("\n[4/4] Normalising scores across all records and ranking ...")
+    ranked_bull, ranked_bear = score_and_rank(buckets)
 
-    # Min-max normalise each dimension across ALL records jointly
-    freq_n = _minmax([r["freq"]    for r in raw])
-    rec_n  = _minmax([r["rec_raw"] for r in raw])
-    eng_n  = _minmax([r["eng_raw"] for r in raw])
+    print("  Bullish candidates : %d" % len(ranked_bull))
+    print("  Bearish candidates : %d" % len(ranked_bear))
 
-    for i, r in enumerate(raw):
-        r["score"] = (
-            WEIGHT_FREQUENCY  * freq_n[i]
-            + WEIGHT_RECENCY    * rec_n[i]
-            + WEIGHT_ENGAGEMENT * eng_n[i]
-        )
+    _print_table(ranked_bull, "BULLISH OPPORTUNITIES")
+    _print_table(ranked_bear, "BEARISH / SHORT CANDIDATES")
 
-    bullish = sorted(
-        [r for r in raw if r["sentiment"] == "Bullish"],
-        key=lambda x: x["score"],
-        reverse=True,
-    )
-    bearish = sorted(
-        [r for r in raw if r["sentiment"] == "Bearish"],
-        key=lambda x: x["score"],
-        reverse=True,
-    )
-
-    _print_table("📈  Bullish Opportunities",      bullish)
-    _print_table("📉  Bearish / Short Candidates", bearish)
-
-    print(
-        f"\n  Scan complete — {len(raw)} record(s) scored, nothing saved to disk.\n"
-    )
+    print(bar)
+    print("  Scan complete -- zero data was stored.")
+    print(bar + "\n")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     run()
