@@ -18,11 +18,13 @@ Rate limiting
   Hard cap   : 60 requests inside any rolling 60-second sliding window
   Auto-pause : if X-Ratelimit-Remaining <= 10, sleep until X-Ratelimit-Reset
   429 retry  : one retry after Retry-After (or 30 s fallback)
-  User-Agent : 'web:KashAnalytics:v1.0.0 (by /u/Kashimmm)' on every request
+  User-Agent : web:KashAnalytics:v1.0.0 (by /u/Kashimmm) on every request
 
 Indian stock validation (yfinance, no hardcoded list)
-  Try {ticker}.NS (NSE) then {ticker}.BO (BSE)
-  Confirmed if yfinance fast_info.currency == 'INR'
+  StockTwits may append its own exchange suffix (e.g. WIPRO.NSE).
+  The bare symbol (split on ".") is extracted first, then .NS and .BO
+  are tried -- preventing invalid chains like WIPRO.NSE.NS.
+  Confirmed if yfinance fast_info.currency == INR.
 """
 
 import math
@@ -30,7 +32,7 @@ import re
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
-from typing import Optional, List, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -43,12 +45,12 @@ from tabulate import tabulate
 STOCKTWITS_BASE = "https://api.stocktwits.com/api/2"
 USER_AGENT      = "web:KashAnalytics:v1.0.0 (by /u/Kashimmm)"
 
-HALF_LIFE_S     = 6 * 3600
-DECAY_LAMBDA    = math.log(2) / HALF_LIFE_S
+HALF_LIFE_S  = 6 * 3600
+DECAY_LAMBDA = math.log(2) / HALF_LIFE_S
 
-RATE_LIMIT      = 60
-WINDOW_S        = 60.0
-PAUSE_THRESH    = 10
+RATE_LIMIT   = 60
+WINDOW_S     = 60.0
+PAUSE_THRESH = 10
 
 WEIGHTS = {
     "frequency":  0.40,
@@ -76,10 +78,7 @@ STOPWORDS = {
 # ========================== SLIDING-WINDOW RATE LIMITER =======================
 
 class _SlidingWindowLimiter:
-    """
-    Enforces at most `limit` HTTP calls inside any rolling `window`-second
-    window. Blocks by sleeping when the window is full.
-    """
+    """Enforces at most `limit` HTTP calls per rolling `window` seconds."""
 
     def __init__(self, limit: int = RATE_LIMIT, window: float = WINDOW_S):
         self._limit  = limit
@@ -107,11 +106,8 @@ _limiter = _SlidingWindowLimiter()
 
 def _get(url: str, params: Optional[Dict] = None) -> Optional[requests.Response]:
     """
-    Rate-limited GET. Enforces:
-      - User-Agent on every single request (no exceptions)
-      - auto-pause when X-Ratelimit-Remaining <= PAUSE_THRESH
-      - exactly one retry on HTTP 429
-    Returns the Response, or None on permanent failure.
+    Rate-limited GET with User-Agent, auto-pause, and one 429 retry.
+    User-Agent is set on every request without exception.
     """
     headers = {"User-Agent": USER_AGENT}
 
@@ -123,7 +119,6 @@ def _get(url: str, params: Optional[Dict] = None) -> Optional[requests.Response]
             print("  [network error] %s" % exc)
             return None
 
-        # auto-pause on low remaining quota
         remaining_hdr = resp.headers.get("X-Ratelimit-Remaining")
         if remaining_hdr is not None:
             try:
@@ -132,29 +127,21 @@ def _get(url: str, params: Optional[Dict] = None) -> Optional[requests.Response]
                 remaining_int = None
             if remaining_int is not None and remaining_int <= PAUSE_THRESH:
                 reset_hdr = resp.headers.get("X-Ratelimit-Reset")
-                if reset_hdr:
-                    wait = max(1, int(reset_hdr) - int(time.time())) + 2
-                else:
-                    wait = 35
+                wait = max(1, int(reset_hdr) - int(time.time())) + 2 if reset_hdr else 35
                 print(
                     "  [auto-pause] X-Ratelimit-Remaining=%d (<=10) "
-                    "-- pausing %ds until quota resets ..." % (remaining_int, wait)
+                    "-- pausing %ds ..." % (remaining_int, wait)
                 )
                 time.sleep(wait)
 
-        # one retry on 429
         if resp.status_code == 429:
             if attempt == 0:
                 retry_after = int(resp.headers.get("Retry-After", 30))
-                print(
-                    "  [429] Rate limited -- waiting %ds before retry ..."
-                    % retry_after
-                )
+                print("  [429] waiting %ds before retry ..." % retry_after)
                 time.sleep(retry_after)
                 continue
-            else:
-                print("  [429] Retry exhausted -- skipping this request.")
-                return None
+            print("  [429] retry exhausted -- skipping.")
+            return None
 
         return resp
 
@@ -164,27 +151,20 @@ def _get(url: str, params: Optional[Dict] = None) -> Optional[requests.Response]
 # ========================== STOCKTWITS API ====================================
 
 def fetch_trending_tickers() -> List[str]:
-    """
-    Call the StockTwits trending/symbols endpoint.
-    Returns raw ticker strings exactly as StockTwits provides them.
-    No hardcoded ticker list is used anywhere in this file.
-    """
+    """Return raw ticker strings from StockTwits trending endpoint."""
     resp = _get(STOCKTWITS_BASE + "/trending/symbols.json")
     if resp is None or resp.status_code != 200:
-        code = resp.status_code if resp is not None else "N/A"
-        print("  [error] trending endpoint returned HTTP %s" % code)
+        print("  [error] trending endpoint returned HTTP %s" % (
+            resp.status_code if resp is not None else "N/A"))
         return []
     symbols = resp.json().get("symbols", [])
     tickers = [s["symbol"] for s in symbols if "symbol" in s]
-    print("  -> %d tickers returned by StockTwits trending" % len(tickers))
+    print("  -> %d tickers from StockTwits trending" % len(tickers))
     return tickers
 
 
 def fetch_messages(ticker: str) -> List[Dict]:
-    """
-    Fetch the public message stream for `ticker` from StockTwits.
-    Returns a (possibly empty) list of raw message dicts.
-    """
+    """Fetch message stream for `ticker` (raw StockTwits symbol)."""
     resp = _get(STOCKTWITS_BASE + "/streams/symbol/" + ticker + ".json")
     if resp is None or resp.status_code != 200:
         return []
@@ -195,13 +175,24 @@ def fetch_messages(ticker: str) -> List[Dict]:
 
 def validate_indian(ticker: str) -> Tuple[bool, str]:
     """
-    Try yfinance with {ticker}.NS (NSE) then {ticker}.BO (BSE).
-    Confirms an Indian listing if fast_info.currency == 'INR'.
-    Returns (is_indian, qualified_symbol).
-    No hardcoded ticker list -- every check is a live yfinance call.
+    Determine whether a StockTwits ticker is listed on NSE or BSE.
+
+    StockTwits sometimes appends its own exchange suffix, e.g.:
+        WIPRO.NSE  INFY.BSE  RELIANCE.NSI
+
+    We strip everything after the first dot to get the bare symbol,
+    then build the yfinance symbol ourselves:
+        bare + ".NS"  (NSE)
+        bare + ".BO"  (BSE)
+
+    This prevents invalid compound suffixes such as WIPRO.NSE.NS.
+
+    A ticker is confirmed Indian if yfinance reports currency == "INR".
+    No hardcoded ticker list is used -- every check is a live API call.
     """
+    bare = ticker.split(".")[0]          # "WIPRO.NSE" -> "WIPRO"
     for suffix in (".NS", ".BO"):
-        sym = ticker + suffix
+        sym = bare + suffix              # "WIPRO.NS" then "WIPRO.BO"
         try:
             fi = yf.Ticker(sym).fast_info
             if getattr(fi, "currency", None) == "INR":
@@ -214,13 +205,11 @@ def validate_indian(ticker: str) -> Tuple[bool, str]:
 # ========================== MESSAGE PARSING ===================================
 
 def _parse_message(raw: Dict) -> Dict:
-    """Extract and pre-compute fields from a raw StockTwits message."""
+    """Extract sentiment, recency decay, and engagement from one message."""
     body      = raw.get("body", "")
     sentiment = ((raw.get("entities") or {}).get("sentiment") or {}).get("basic")
-
-    likes    = int((raw.get("likes")    or {}).get("total",          0) or 0)
-    reshares = int((raw.get("reshares") or {}).get("reshared_count", 0) or 0)
-    engagement = likes + reshares
+    likes     = int((raw.get("likes")    or {}).get("total",          0) or 0)
+    reshares  = int((raw.get("reshares") or {}).get("reshared_count", 0) or 0)
 
     created_raw = raw.get("created_at", "")
     try:
@@ -229,20 +218,17 @@ def _parse_message(raw: Dict) -> Dict:
     except (ValueError, AttributeError):
         age_s = 0.0
 
-    recency_decay = math.exp(-DECAY_LAMBDA * age_s)
-
     return {
         "body":       body,
-        "sentiment":  sentiment,
-        "recency":    recency_decay,
-        "engagement": engagement,
+        "sentiment":  sentiment,           # "Bullish" | "Bearish" | None
+        "recency":    math.exp(-DECAY_LAMBDA * age_s),
+        "engagement": likes + reshares,
     }
 
 
 # ========================== SCORING ENGINE ====================================
 
 def _minmax(arr: np.ndarray) -> np.ndarray:
-    """Min-max normalise to [0,1]. All-equal input maps to all-zero."""
     lo, hi = arr.min(), arr.max()
     if hi == lo:
         return np.zeros_like(arr, dtype=float)
@@ -250,7 +236,6 @@ def _minmax(arr: np.ndarray) -> np.ndarray:
 
 
 def _key_narrative(messages: List[Dict]) -> str:
-    """Top-3 non-stopword words from message bodies, joined by ' | '."""
     words: List[str] = []
     for m in messages:
         tokens = re.findall(r"[A-Za-z]{3,}", m.get("body", ""))
@@ -262,38 +247,29 @@ def _key_narrative(messages: List[Dict]) -> str:
 
 def score_and_rank(buckets: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
     """
-    Build raw records for every ticker x sentiment pair, then apply
-    min-max normalisation across ALL records jointly (both Bullish and
-    Bearish together) before weighting -- satisfying the spec requirement
-    'min-max normalisation across all records before weighting'.
-
-    Returns (ranked_bullish, ranked_bearish), each sorted descending by
-    composite score with integer ranks assigned from 1.
+    Compute raw Frequency/Recency/Engagement for every ticker x sentiment pair.
+    Min-max normalise across ALL records jointly (both sentiments together) then
+    apply weights. Split and rank each sentiment table independently.
     """
-    # 1. Build raw records for both sentiments
     all_rows: List[Dict] = []
     for b in buckets:
         for sentiment in ("Bullish", "Bearish"):
             msgs = [m for m in b["parsed"] if m["sentiment"] == sentiment]
             if not msgs:
                 continue
-            freq_raw = float(len(msgs))
-            rec_raw  = float(sum(m["recency"]    for m in msgs) / len(msgs))
-            eng_raw  = float(sum(m["engagement"] for m in msgs))
             all_rows.append({
                 "ticker":        b["ticker"],
                 "sentiment":     sentiment,
-                "mention_count": int(freq_raw),
-                "freq_raw":      freq_raw,
-                "rec_raw":       rec_raw,
-                "eng_raw":       eng_raw,
+                "mention_count": len(msgs),
+                "freq_raw":      float(len(msgs)),
+                "rec_raw":       float(sum(m["recency"]    for m in msgs) / len(msgs)),
+                "eng_raw":       float(sum(m["engagement"] for m in msgs)),
                 "messages":      msgs,
             })
 
     if not all_rows:
         return [], []
 
-    # 2. Min-max normalise ACROSS ALL records (both sentiments jointly)
     freq_norm = _minmax(np.array([r["freq_raw"] for r in all_rows], dtype=float))
     rec_norm  = _minmax(np.array([r["rec_raw"]  for r in all_rows], dtype=float))
     eng_norm  = _minmax(np.array([r["eng_raw"]  for r in all_rows], dtype=float))
@@ -307,24 +283,17 @@ def score_and_rank(buckets: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
             + WEIGHTS["engagement"] * float(eng_norm[i])
         )
 
-    # 3. Split by sentiment, sort each table independently
-    bull_rows = sorted(
-        [r for r in all_rows if r["sentiment"] == "Bullish"],
-        key=lambda r: r["composite"],
-        reverse=True,
-    )
-    bear_rows = sorted(
-        [r for r in all_rows if r["sentiment"] == "Bearish"],
-        key=lambda r: r["composite"],
-        reverse=True,
-    )
+    bull = sorted([r for r in all_rows if r["sentiment"] == "Bullish"],
+                  key=lambda r: r["composite"], reverse=True)
+    bear = sorted([r for r in all_rows if r["sentiment"] == "Bearish"],
+                  key=lambda r: r["composite"], reverse=True)
 
-    for rank, row in enumerate(bull_rows, start=1):
+    for rank, row in enumerate(bull, 1):
         row["rank"] = rank
-    for rank, row in enumerate(bear_rows, start=1):
+    for rank, row in enumerate(bear, 1):
         row["rank"] = rank
 
-    return bull_rows, bear_rows
+    return bull, bear
 
 
 # ========================== OUTPUT FORMATTING =================================
@@ -339,27 +308,19 @@ def _print_table(ranked: List[Dict], title: str) -> None:
     if not ranked:
         print("  No Indian tickers detected in this scan.\n")
         return
-    headers = [
-        "Rank", "Ticker", "Mention Count",
-        "Recency Rating", "Engagement Rating", "Key Narrative",
+    headers = ["Rank", "Ticker", "Mention Count",
+                "Recency Rating", "Engagement Rating", "Key Narrative"]
+    table = [
+        [r["rank"], r["ticker"], r["mention_count"],
+         "%.4f" % r["recency_score"], "%.4f" % r["engagement_score"],
+         _key_narrative(r["messages"])[:52]]
+        for r in ranked
     ]
-    table = []
-    for row in ranked:
-        narrative = _key_narrative(row["messages"])
-        table.append([
-            row["rank"],
-            row["ticker"],
-            row["mention_count"],
-            "%.4f" % row["recency_score"],
-            "%.4f" % row["engagement_score"],
-            narrative[:52],
-        ])
     print(tabulate(table, headers=headers, tablefmt="rounded_outline"))
     print()
 
 
 def _empty_tables() -> None:
-    """Print clean empty tables with the required no-Indian-tickers message."""
     for title in ("BULLISH OPPORTUNITIES", "BEARISH / SHORT CANDIDATES"):
         print("\n" + _BAR)
         print("  " + title)
@@ -370,89 +331,66 @@ def _empty_tables() -> None:
 # ========================== MAIN PIPELINE =====================================
 
 def run() -> None:
-    bar = "-" * 74
-    print("\n" + bar)
+    sep = "-" * 74
+    print("\n" + sep)
     print("  Kash Analytics -- StockTwits Indian Market Screener")
     print("  Phase 1B  |  Fetch -> Analyse -> Display -> Discard")
-    print(
-        "  Weights: Frequency %.0f%%  Recency %.0f%%  Engagement %.0f%%"
-        "  |  Recency half-life 6h  |  Rate cap %d req/min"
-        % (
-            WEIGHTS["frequency"]  * 100,
-            WEIGHTS["recency"]    * 100,
-            WEIGHTS["engagement"] * 100,
-            RATE_LIMIT,
-        )
-    )
-    print(bar + "\n")
+    print("  Weights: Frequency %.0f%%  Recency %.0f%%  Engagement %.0f%%"
+          "  |  Half-life 6h  |  Cap %d req/min" % (
+              WEIGHTS["frequency"] * 100, WEIGHTS["recency"] * 100,
+              WEIGHTS["engagement"] * 100, RATE_LIMIT))
+    print(sep + "\n")
 
-    # Step 1: Trending tickers (no hardcoded list)
     print("[1/4] Fetching trending symbols from StockTwits ...")
     raw_tickers = fetch_trending_tickers()
     if not raw_tickers:
-        print("  [abort] StockTwits returned no trending symbols.")
+        print("  [abort] no trending symbols returned.")
         _empty_tables()
         return
 
-    # Step 2: Filter to Indian stocks via yfinance currency check
-    print(
-        "\n[2/4] Validating %d ticker(s) against NSE/BSE via yfinance ..."
-        % len(raw_tickers)
-    )
+    print("\n[2/4] Validating %d ticker(s) against NSE/BSE ..." % len(raw_tickers))
     indian: List[Tuple[str, str]] = []
     for raw in raw_tickers:
         ok, sym = validate_indian(raw)
         if ok:
-            print("  [OK]  %-14s -> %s" % (raw, sym))
+            print("  [OK]  %-16s -> %s" % (raw, sym))
             indian.append((raw, sym))
 
     if not indian:
-        print(
-            "\n  No Indian (NSE/BSE) tickers found among current "
-            "StockTwits trending symbols."
-        )
+        print("\n  No Indian tickers found in StockTwits trending.")
         _empty_tables()
         return
-
     print("\n  -> %d Indian ticker(s) confirmed." % len(indian))
 
-    # Step 3: Fetch message streams
     print("\n[3/4] Fetching message streams ...")
     buckets: List[Dict] = []
     for raw_ticker, qualified in indian:
-        raw_msgs = fetch_messages(raw_ticker)
-        if not raw_msgs:
-            print("  [skip] %s: no messages returned." % qualified)
+        msgs = fetch_messages(raw_ticker)
+        if not msgs:
+            print("  [skip] %s -- no messages returned." % qualified)
             continue
-        parsed = [_parse_message(m) for m in raw_msgs]
-        n_bull = sum(1 for p in parsed if p["sentiment"] == "Bullish")
-        n_bear = sum(1 for p in parsed if p["sentiment"] == "Bearish")
-        n_neut = len(parsed) - n_bull - n_bear
-        print(
-            "  [OK]  %-14s  %3d messages  "
-            "(Bullish=%d  Bearish=%d  Neutral=%d)"
-            % (qualified, len(parsed), n_bull, n_bear, n_neut)
-        )
+        parsed = [_parse_message(m) for m in msgs]
+        n_b = sum(1 for p in parsed if p["sentiment"] == "Bullish")
+        n_s = sum(1 for p in parsed if p["sentiment"] == "Bearish")
+        print("  [OK]  %-16s  %3d msgs  (Bull=%d Bear=%d Neutral=%d)" % (
+            qualified, len(parsed), n_b, n_s, len(parsed) - n_b - n_s))
         buckets.append({"ticker": qualified, "parsed": parsed})
 
     if not buckets:
-        print("  No message data returned for any Indian ticker.")
+        print("  No message data for any Indian ticker.")
         _empty_tables()
         return
 
-    # Step 4: Normalise across all records (both sentiments), rank, display
-    print("\n[4/4] Normalising scores across all records and ranking ...")
+    print("\n[4/4] Normalising and ranking ...")
     ranked_bull, ranked_bear = score_and_rank(buckets)
-
-    print("  Bullish candidates : %d" % len(ranked_bull))
-    print("  Bearish candidates : %d" % len(ranked_bear))
+    print("  Bullish: %d  Bearish: %d" % (len(ranked_bull), len(ranked_bear)))
 
     _print_table(ranked_bull, "BULLISH OPPORTUNITIES")
     _print_table(ranked_bear, "BEARISH / SHORT CANDIDATES")
 
-    print(bar)
+    print(sep)
     print("  Scan complete -- zero data was stored.")
-    print(bar + "\n")
+    print(sep + "\n")
 
 
 if __name__ == "__main__":
